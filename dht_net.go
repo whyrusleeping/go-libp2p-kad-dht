@@ -15,7 +15,7 @@ import (
 	peer "github.com/libp2p/go-libp2p-peer"
 )
 
-var dhtReadMessageTimeout = time.Minute
+const dhtMessageTimeout = 1 * time.Minute
 var ErrReadTimeout = fmt.Errorf("timed out reading response")
 
 type bufferedWriteCloser interface {
@@ -59,6 +59,7 @@ func (dht *IpfsDHT) handleNewMessage(s inet.Stream) {
 	for {
 		// receive msg
 		pmes := new(pb.Message)
+		s.SetReadDeadline(time.Now().Add(dhtMessageTimeout))
 		switch err := r.ReadMsg(pmes); err {
 		case io.EOF:
 			s.Close()
@@ -96,6 +97,7 @@ func (dht *IpfsDHT) handleNewMessage(s inet.Stream) {
 		}
 
 		// send out response msg
+		s.SetWriteDeadline(time.Now().Add(dhtMessageTimeout))
 		err = w.WriteMsg(rpmes)
 		if err == nil {
 			err = w.Flush()
@@ -232,7 +234,6 @@ func (ms *messageSender) prep() error {
 	if err != nil {
 		return err
 	}
-
 	ms.r = ggio.NewDelimitedReader(nstr, inet.MessageSizeMax)
 	ms.w = newBufferedDelimitedWriter(nstr)
 	ms.s = nstr
@@ -342,10 +343,11 @@ func (ms *messageSender) writeMsg(pmes *pb.Message) error {
 func (ms *messageSender) ctxReadMsg(ctx context.Context, mes *pb.Message) error {
 	errc := make(chan error, 1)
 	go func(r ggio.ReadCloser) {
+		ms.s.SetReadDeadline(time.Now().Add(dhtMessageTimeout))
 		errc <- r.ReadMsg(mes)
 	}(ms.r)
 
-	t := time.NewTimer(dhtReadMessageTimeout)
+	t := time.NewTimer(dhtMessageTimeout)
 	defer t.Stop()
 
 	select {
