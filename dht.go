@@ -59,11 +59,9 @@ type IpfsDHT struct {
 	ctx  context.Context
 	proc goprocess.Process
 
-	strmap map[peer.ID]*messageSender
-	smlk   sync.Mutex
+	streamPool streamPool
 
-	plk sync.Mutex
-
+	plk       sync.Mutex
 	protocols []protocol.ID // DHT protocols
 }
 
@@ -144,16 +142,14 @@ func makeDHT(ctx context.Context, h host.Host, dstore ds.Batching, protocols []p
 		self:         h.ID(),
 		peerstore:    h.Peerstore(),
 		host:         h,
-		strmap:       make(map[peer.ID]*messageSender),
 		ctx:          ctx,
 		providers:    providers.NewProviderManager(ctx, h.ID(), dstore),
 		birth:        time.Now(),
 		routingTable: rt,
 		protocols:    protocols,
 	}
-
+	dht.streamPool.newStream = dht.newStream
 	dht.ctx = dht.newContextWithLocalTags(ctx)
-
 	return dht
 }
 

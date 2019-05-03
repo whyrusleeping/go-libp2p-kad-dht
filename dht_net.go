@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"sync"
 	"time"
 
 	ggio "github.com/gogo/protobuf/io"
@@ -18,7 +17,6 @@ import (
 	"go.opencensus.io/tag"
 )
 
-var dhtReadMessageTimeout = time.Minute
 var ErrReadTimeout = fmt.Errorf("timed out reading response")
 
 type bufferedWriteCloser interface {
@@ -58,7 +56,6 @@ func (dht *IpfsDHT) handleNewStream(s inet.Stream) {
 // Returns true on orderly completion of writes (so we can Close the stream).
 func (dht *IpfsDHT) handleNewMessage(s inet.Stream) bool {
 	ctx := dht.ctx
-
 	cr := ctxio.NewReader(ctx, s) // ok to use. we defer close stream in this func
 	cw := ctxio.NewWriter(ctx, s) // ok to use. we defer close stream in this func
 	r := ggio.NewDelimitedReader(cr, inet.MessageSizeMax)
@@ -127,70 +124,53 @@ func (dht *IpfsDHT) handleNewMessage(s inet.Stream) bool {
 			logger.Debugf("error writing response: %v", err)
 			return false
 		}
-
 		elapsedTime := time.Since(startTime)
 		latencyMillis := float64(elapsedTime) / float64(time.Millisecond)
 		stats.Record(ctx, metrics.InboundRequestLatency.M(latencyMillis))
 	}
 }
 
-// sendRequest sends out a request, but also makes sure to
-// measure the RTT for latency measurements.
-func (dht *IpfsDHT) sendRequest(ctx context.Context, p peer.ID, pmes *pb.Message) (*pb.Message, error) {
-	ctx, _ = tag.New(ctx, metrics.UpsertMessageType(pmes))
-
-	ms, err := dht.messageSenderForPeer(ctx, p)
-	if err != nil {
+// sendRequest sends out a request, but also makes sure to measure the RTT for latency measurements.
+func (dht *IpfsDHT) sendRequest(ctx context.Context, p peer.ID, req *pb.Message) (_ *pb.Message, err error) {
+	ctx, _ = tag.New(ctx, metrics.UpsertMessageType(req))
+	dht.recordOutboundMessage(ctx, req)
+	started := time.Now()
+	defer dht.observeRpcLatency(req, "request", &err, started)
+	reply, err := dht.streamPool.getPeer(p).doRequest(ctx, req)
+	if err == nil {
+		dht.updateFromMessage(ctx, p, reply)
+		dht.peerstore.RecordLatency(p, time.Since(started))
+		stats.Record(
+			ctx,
+			metrics.SentRequests.M(1),
+			metrics.SentBytes.M(int64(req.Size())),
+			metrics.OutboundRequestLatency.M(
+				float64(time.Since(started))/float64(time.Millisecond),
+			),
+		)
+	} else {
 		stats.Record(ctx, metrics.SentRequestErrors.M(1))
-		return nil, err
 	}
-
-	start := time.Now()
-
-	rpmes, err := ms.SendRequest(ctx, pmes)
-	if err != nil {
-		stats.Record(ctx, metrics.SentRequestErrors.M(1))
-		return nil, err
-	}
-
-	// update the peer (on valid msgs only)
-	dht.updateFromMessage(ctx, p, rpmes)
-
-	stats.Record(
-		ctx,
-		metrics.SentRequests.M(1),
-		metrics.SentBytes.M(int64(pmes.Size())),
-		metrics.OutboundRequestLatency.M(
-			float64(time.Since(start))/float64(time.Millisecond),
-		),
-	)
-	dht.peerstore.RecordLatency(p, time.Since(start))
-	logger.Event(ctx, "dhtReceivedMessage", dht.self, p, rpmes)
-	return rpmes, nil
+	return reply, err
 }
 
 // sendMessage sends out a message
 func (dht *IpfsDHT) sendMessage(ctx context.Context, p peer.ID, pmes *pb.Message) error {
 	ctx, _ = tag.New(ctx, metrics.UpsertMessageType(pmes))
-
-	ms, err := dht.messageSenderForPeer(ctx, p)
-	if err != nil {
+	dht.recordOutboundMessage(ctx, pmes)
+	started := time.Now()
+	err := dht.streamPool.getPeer(p).send(ctx, pmes)
+	if err == nil {
+		stats.Record(
+			ctx,
+			metrics.SentMessages.M(1),
+			metrics.SentBytes.M(int64(pmes.Size())),
+		)
+	} else {
 		stats.Record(ctx, metrics.SentMessageErrors.M(1))
-		return err
 	}
-
-	if err := ms.SendMessage(ctx, pmes); err != nil {
-		stats.Record(ctx, metrics.SentMessageErrors.M(1))
-		return err
-	}
-
-	stats.Record(
-		ctx,
-		metrics.SentMessages.M(1),
-		metrics.SentBytes.M(int64(pmes.Size())),
-	)
-	logger.Event(ctx, "dhtSentMessage", dht.self, p, pmes)
-	return nil
+	dht.observeRpcLatency(pmes, "send", &err, started)
+	return err
 }
 
 func (dht *IpfsDHT) updateFromMessage(ctx context.Context, p peer.ID, mes *pb.Message) error {
@@ -202,202 +182,13 @@ func (dht *IpfsDHT) updateFromMessage(ctx context.Context, p peer.ID, mes *pb.Me
 	return nil
 }
 
-func (dht *IpfsDHT) messageSenderForPeer(ctx context.Context, p peer.ID) (*messageSender, error) {
-	dht.smlk.Lock()
-	ms, ok := dht.strmap[p]
-	if ok {
-		dht.smlk.Unlock()
-		return ms, nil
-	}
-	ms = &messageSender{p: p, dht: dht}
-	dht.strmap[p] = ms
-	dht.smlk.Unlock()
-
-	if err := ms.prepOrInvalidate(ctx); err != nil {
-		dht.smlk.Lock()
-		defer dht.smlk.Unlock()
-
-		if msCur, ok := dht.strmap[p]; ok {
-			// Changed. Use the new one, old one is invalid and
-			// not in the map so we can just throw it away.
-			if ms != msCur {
-				return msCur, nil
-			}
-			// Not changed, remove the now invalid stream from the
-			// map.
-			delete(dht.strmap, p)
-		}
-		// Invalid but not in map. Must have been removed by a disconnect.
-		return nil, err
-	}
-	// All ready to go.
-	return ms, nil
+func (dht *IpfsDHT) newNetStream(ctx context.Context, p peer.ID) (inet.Stream, error) {
+	s, err := dht.host.NewStream(ctx, p, dht.protocols...)
+	return s, err
 }
 
-type messageSender struct {
-	s   inet.Stream
-	r   ggio.ReadCloser
-	w   bufferedWriteCloser
-	lk  sync.Mutex
-	p   peer.ID
-	dht *IpfsDHT
-
-	invalid   bool
-	singleMes int
+func (dht *IpfsDHT) recordOutboundMessage(ctx context.Context, m *pb.Message) {
 }
 
-// invalidate is called before this messageSender is removed from the strmap.
-// It prevents the messageSender from being reused/reinitialized and then
-// forgotten (leaving the stream open).
-func (ms *messageSender) invalidate() {
-	ms.invalid = true
-	if ms.s != nil {
-		ms.s.Reset()
-		ms.s = nil
-	}
-}
-
-func (ms *messageSender) prepOrInvalidate(ctx context.Context) error {
-	ms.lk.Lock()
-	defer ms.lk.Unlock()
-	if err := ms.prep(ctx); err != nil {
-		ms.invalidate()
-		return err
-	}
-	return nil
-}
-
-func (ms *messageSender) prep(ctx context.Context) error {
-	if ms.invalid {
-		return fmt.Errorf("message sender has been invalidated")
-	}
-	if ms.s != nil {
-		return nil
-	}
-
-	nstr, err := ms.dht.host.NewStream(ctx, ms.p, ms.dht.protocols...)
-	if err != nil {
-		return err
-	}
-
-	ms.r = ggio.NewDelimitedReader(nstr, inet.MessageSizeMax)
-	ms.w = newBufferedDelimitedWriter(nstr)
-	ms.s = nstr
-
-	return nil
-}
-
-// streamReuseTries is the number of times we will try to reuse a stream to a
-// given peer before giving up and reverting to the old one-message-per-stream
-// behaviour.
-const streamReuseTries = 3
-
-func (ms *messageSender) SendMessage(ctx context.Context, pmes *pb.Message) error {
-	ms.lk.Lock()
-	defer ms.lk.Unlock()
-	retry := false
-	for {
-		if err := ms.prep(ctx); err != nil {
-			return err
-		}
-
-		if err := ms.writeMsg(pmes); err != nil {
-			ms.s.Reset()
-			ms.s = nil
-
-			if retry {
-				logger.Info("error writing message, bailing: ", err)
-				return err
-			}
-			logger.Info("error writing message, trying again: ", err)
-			retry = true
-			continue
-		}
-
-		logger.Event(ctx, "dhtSentMessage", ms.dht.self, ms.p, pmes)
-
-		if ms.singleMes > streamReuseTries {
-			go inet.FullClose(ms.s)
-			ms.s = nil
-		} else if retry {
-			ms.singleMes++
-		}
-
-		return nil
-	}
-}
-
-func (ms *messageSender) SendRequest(ctx context.Context, pmes *pb.Message) (*pb.Message, error) {
-	ms.lk.Lock()
-	defer ms.lk.Unlock()
-	retry := false
-	for {
-		if err := ms.prep(ctx); err != nil {
-			return nil, err
-		}
-
-		if err := ms.writeMsg(pmes); err != nil {
-			ms.s.Reset()
-			ms.s = nil
-
-			if retry {
-				logger.Info("error writing message, bailing: ", err)
-				return nil, err
-			}
-			logger.Info("error writing message, trying again: ", err)
-			retry = true
-			continue
-		}
-
-		mes := new(pb.Message)
-		if err := ms.ctxReadMsg(ctx, mes); err != nil {
-			ms.s.Reset()
-			ms.s = nil
-
-			if retry {
-				logger.Info("error reading message, bailing: ", err)
-				return nil, err
-			}
-			logger.Info("error reading message, trying again: ", err)
-			retry = true
-			continue
-		}
-
-		logger.Event(ctx, "dhtSentMessage", ms.dht.self, ms.p, pmes)
-
-		if ms.singleMes > streamReuseTries {
-			go inet.FullClose(ms.s)
-			ms.s = nil
-		} else if retry {
-			ms.singleMes++
-		}
-
-		return mes, nil
-	}
-}
-
-func (ms *messageSender) writeMsg(pmes *pb.Message) error {
-	if err := ms.w.WriteMsg(pmes); err != nil {
-		return err
-	}
-	return ms.w.Flush()
-}
-
-func (ms *messageSender) ctxReadMsg(ctx context.Context, mes *pb.Message) error {
-	errc := make(chan error, 1)
-	go func(r ggio.ReadCloser) {
-		errc <- r.ReadMsg(mes)
-	}(ms.r)
-
-	t := time.NewTimer(dhtReadMessageTimeout)
-	defer t.Stop()
-
-	select {
-	case err := <-errc:
-		return err
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-t.C:
-		return ErrReadTimeout
-	}
+func (dht *IpfsDHT) observeRpcLatency(sent *pb.Message, rpcType string, err *error, started time.Time) {
 }

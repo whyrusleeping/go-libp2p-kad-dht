@@ -31,4 +31,5 @@ require (
 	github.com/whyrusleeping/base32 v0.0.0-20170828182744-c30ac30633cc
 	go.opencensus.io v0.20.2
 	golang.org/x/xerrors v0.0.0-20190212162355-a5947ffaace3
+	gopkg.in/yaml.v2 v2.2.2 // indirect
 )
