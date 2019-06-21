@@ -58,7 +58,7 @@ type IpfsDHT struct {
 
 	datastore ds.Datastore // Local data
 
-	routingTable *kb.RoutingTable // Array of routing tables for differently distanced nodes
+	routingTable *CompositeRoutingTable
 	providers    *providers.ProviderManager
 
 	birth time.Time // When this peer started up
@@ -77,6 +77,8 @@ type IpfsDHT struct {
 
 	mode   DHTMode
 	modeLk sync.Mutex
+
+	restrictRoutingToLatestVersion bool
 }
 
 // Assert that IPFS assumptions about interfaces aren't broken. These aren't a
@@ -111,6 +113,7 @@ func New(ctx context.Context, h host.Host, options ...opts.Option) (*IpfsDHT, er
 	dht.proc.AddChild(dht.providers.Process())
 	dht.Validator = cfg.Validator
 	dht.mode = ModeClient
+	dht.restrictRoutingToLatestVersion = !cfg.ConnectToOldNodes
 
 	if !cfg.Client {
 		dht.mode = ModeServer
@@ -145,15 +148,25 @@ func NewDHTClient(ctx context.Context, h host.Host, dstore ds.Batching) *IpfsDHT
 }
 
 func makeDHT(ctx context.Context, h host.Host, dstore ds.Batching, protocols []protocol.ID) *IpfsDHT {
-	rt := kb.NewRoutingTable(KValue, kb.ConvertPeerID(h.ID()), time.Minute, h.Peerstore())
-
 	cmgr := h.ConnManager()
-	rt.PeerAdded = func(p peer.ID) {
-		cmgr.TagPeer(p, "kbucket", 5)
+
+	peerAdded := func(p peer.ID) { cmgr.TagPeer(p, "kbucket", 5) }
+	peerRemoved := func(p peer.ID) { cmgr.UntagPeer(p, "kbucket") }
+
+	// TODO: source params from cfg.
+	cfg := &CompositeRoutingTableConfig{
+		LocalID:     h.ID(),
+		Latency:     time.Minute,
+		Metrics:     h.Peerstore(),
+		PeerAdded:   peerAdded,
+		PeerRemoved: peerRemoved,
+		Partitions: []CompositeRoutingTablePartition{
+			{string(opts.ProtocolDHT), 20},
+			{string(opts.ProtocolDHT100), 3}, // residual quota for old peers.
+		},
 	}
-	rt.PeerRemoved = func(p peer.ID) {
-		cmgr.UntagPeer(p, "kbucket")
-	}
+
+	rt := NewCompositeRoutingTable(cfg)
 
 	dht := &IpfsDHT{
 		datastore:    dstore,
@@ -175,7 +188,6 @@ func makeDHT(ctx context.Context, h host.Host, dstore ds.Batching, protocols []p
 
 // putValueToPeer stores the given key/value pair at the peer 'p'
 func (dht *IpfsDHT) putValueToPeer(ctx context.Context, p peer.ID, rec *recpb.Record) error {
-
 	pmes := pb.NewMessage(pb.Message_PUT_VALUE, rec.Key, 0)
 	pmes.Record = rec
 	rpmes, err := dht.sendRequest(ctx, p, pmes)
@@ -199,7 +211,6 @@ var errInvalidRecord = errors.New("received invalid record")
 // NOTE: It will update the dht's peerstore with any new addresses
 // it finds for the given peer.
 func (dht *IpfsDHT) getValueOrPeers(ctx context.Context, p peer.ID, key string) (*recpb.Record, []*peer.AddrInfo, error) {
-
 	pmes, err := dht.getValueSingle(ctx, p, key)
 	if err != nil {
 		return nil, nil, err
@@ -446,7 +457,7 @@ func (dht *IpfsDHT) Process() goprocess.Process {
 }
 
 // RoutingTable return dht's routingTable
-func (dht *IpfsDHT) RoutingTable() *kb.RoutingTable {
+func (dht *IpfsDHT) RoutingTable() RoutingTable {
 	return dht.routingTable
 }
 
