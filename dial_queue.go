@@ -4,10 +4,13 @@ import (
 	"context"
 	"math"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/libp2p/go-libp2p-core/peer"
+	"github.com/libp2p/go-libp2p-kad-dht/metrics"
 	queue "github.com/libp2p/go-libp2p-peerstore/queue"
+	"go.opencensus.io/stats"
 )
 
 const (
@@ -39,6 +42,10 @@ type dialQueue struct {
 	dieCh     chan struct{}
 	growCh    chan struct{}
 	shrinkCh  chan struct{}
+
+	// stats
+	successes int64
+	failures  int64
 }
 
 type dqParams struct {
@@ -128,6 +135,9 @@ func (dq *dialQueue) control() {
 	)
 
 	defer func() {
+		stats.Record(dq.ctx, metrics.SuccessfulDialsPerQuery.M(atomic.LoadInt64(&dq.successes)))
+		stats.Record(dq.ctx, metrics.FailedDialsPerQuery.M(atomic.LoadInt64(&dq.failures)))
+
 		for _, w := range waiting {
 			close(w.ch)
 		}
@@ -325,9 +335,11 @@ func (dq *dialQueue) worker() {
 
 			t := time.Now()
 			if err := dq.dialFn(dq.ctx, p); err != nil {
+				atomic.AddInt64(&dq.failures, 1)
 				logger.Debugf("discarding dialled peer because of error: %v", err)
 				continue
 			}
+			atomic.AddInt64(&dq.successes, 1)
 			logger.Debugf("dialling %v took %dms (as observed by the dht subsystem).", p, time.Since(t)/time.Millisecond)
 			waiting := len(dq.waitingCh)
 
