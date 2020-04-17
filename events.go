@@ -3,6 +3,7 @@ package dht
 import (
 	"context"
 	"encoding/json"
+	"github.com/libp2p/go-libp2p-core/event"
 	"sync"
 
 	"github.com/google/uuid"
@@ -235,7 +236,9 @@ var LookupEventBufferSize = 16
 
 // PublishLookupEvent publishes a query event to the query event channel
 // associated with the given context, if any.
-func PublishLookupEvent(ctx context.Context, ev *LookupEvent) {
+func (dht *IpfsDHT) PublishLookupEvent(ctx context.Context, ev *LookupEvent) {
+	dht.emitLookupEventToBus(ev)
+
 	ich := ctx.Value(routingLookupKey{})
 	if ich == nil {
 		return
@@ -244,4 +247,18 @@ func PublishLookupEvent(ctx context.Context, ev *LookupEvent) {
 	// We *want* to panic here.
 	ech := ich.(*lookupEventChannel)
 	ech.send(ctx, ev)
+
+}
+
+func (dht *IpfsDHT) emitLookupEventToBus(ev *LookupEvent) {
+	js, err := json.Marshal(ev)
+	if err != nil {
+		logger.Errorf("failed to marshal lookup event to Json,err=%s", err)
+		return
+	}
+	// send it on the eventbus
+	lookUpEvent := event.DhtEvent{EventType: "LookupEvent", EventJson: event.JSString(string(js))}
+	if err := dht.eventsEmitter.Emit(lookUpEvent); err != nil {
+		logger.Errorf("failed to emit DhtEvent on the bus, err=%s", err)
+	}
 }
