@@ -92,6 +92,10 @@ func (c *config) applyFallbacks(h host.Host) error {
 			return fmt.Errorf("the default validator was changed without being marked as changed")
 		}
 	}
+
+	if !c.enableValues {
+		c.validator = nil
+	}
 	return nil
 }
 
