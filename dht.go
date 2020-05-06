@@ -305,10 +305,22 @@ func makeRoutingTable(dht *IpfsDHT, cfg config) (*kb.RoutingTable, error) {
 	cmgr := dht.host.ConnManager()
 
 	rt.PeerAdded = func(p peer.ID) {
+		PublishRoutingTableEvent(dht.ctx, NewRoutingTableEvent(NewRoutingTablePeerUpdatedEvent(
+			[]peer.ID{p},
+			nil,
+			nil,
+		), nil))
+
 		commonPrefixLen := kb.CommonPrefixLen(self, kb.ConvertPeerID(p))
 		cmgr.TagPeer(p, "kbucket", BaseConnMgrScore+commonPrefixLen)
 	}
 	rt.PeerRemoved = func(p peer.ID) {
+		PublishRoutingTableEvent(dht.ctx, NewRoutingTableEvent(NewRoutingTablePeerUpdatedEvent(
+			nil,
+			[]peer.ID{p},
+			nil,
+		), nil))
+
 		cmgr.UntagPeer(p, "kbucket")
 
 		// try to fix the RT
