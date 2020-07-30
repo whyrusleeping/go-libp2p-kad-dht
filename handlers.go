@@ -9,6 +9,8 @@ import (
 
 	"github.com/libp2p/go-libp2p-core/peer"
 	"github.com/libp2p/go-libp2p-core/peerstore"
+	"github.com/libp2p/go-libp2p-core/record"
+
 	pstore "github.com/libp2p/go-libp2p-peerstore"
 
 	"github.com/gogo/protobuf/proto"
@@ -84,6 +86,16 @@ func (dht *IpfsDHT) handleGetValue(ctx context.Context, p peer.ID, pmes *pb.Mess
 		}
 
 		resp.CloserPeers = pb.PeerInfosToPBPeers(dht.host.Network(), closerinfos)
+
+		// add signed peer records too as we support them
+		var signedRecords []*record.Envelope
+		for i := range closer {
+			rec := dht.ca.GetPeerRecord(closer[i])
+			if rec != nil {
+				signedRecords = append(signedRecords, rec)
+			}
+		}
+		resp.SignedCloserPeers = pb.PeerSignedRecordsToPBSignedPeerRecords(dht.host.Network(), signedRecords)
 	}
 
 	return resp, nil
@@ -303,6 +315,17 @@ func (dht *IpfsDHT) handleFindPeer(ctx context.Context, from peer.ID, pmes *pb.M
 	}
 
 	resp.CloserPeers = pb.PeerInfosToPBPeers(dht.host.Network(), withAddresses)
+
+	// add signed records too as we support them.
+	var signedRecords []*record.Envelope
+	for i := range closest {
+		rec := dht.ca.GetPeerRecord(closest[i])
+		if rec != nil {
+			signedRecords = append(signedRecords, rec)
+		}
+	}
+	resp.SignedCloserPeers = pb.PeerSignedRecordsToPBSignedPeerRecords(dht.host.Network(), signedRecords)
+
 	return resp, nil
 }
 
