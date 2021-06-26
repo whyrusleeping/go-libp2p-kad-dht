@@ -26,6 +26,7 @@ import (
 	"github.com/libp2p/go-libp2p-kbucket/peerdiversity"
 	record "github.com/libp2p/go-libp2p-record"
 	recpb "github.com/libp2p/go-libp2p-record/pb"
+	sr "github.com/libp2p/go-smart-record/protocol"
 
 	"github.com/gogo/protobuf/proto"
 	ds "github.com/ipfs/go-datastore"
@@ -60,7 +61,8 @@ const (
 )
 
 const (
-	kad1 protocol.ID = "/kad/1.0.0"
+	kad1    protocol.ID = "/kad/1.0.0"
+	srDhtId protocol.ID = "/sr/dht/0.0.1"
 )
 
 const (
@@ -148,6 +150,10 @@ type IpfsDHT struct {
 
 	// configuration variables for tests
 	testAddressUpdateProcessing bool
+
+	// smart records
+	srClient sr.SmartRecordClient
+	srServer sr.SmartRecordServer
 }
 
 // Assert that IPFS assumptions about interfaces aren't broken. These aren't a
@@ -206,6 +212,18 @@ func New(ctx context.Context, h host.Host, options ...Option) (*IpfsDHT, error) 
 		dht.mode = modeServer
 	default:
 		return nil, fmt.Errorf("invalid dht mode %d", cfg.Mode)
+	}
+
+	// Start smart record service if enabled
+	if cfg.SmartRecords {
+		dht.srServer, err = sr.NewSmartRecordServer(ctx, h, []sr.ServerOption{sr.ServerProtocolPrefix(cfg.ProtocolPrefix)}...)
+		if err != nil {
+			return nil, fmt.Errorf("couldn't start smart record server: %v", err)
+		}
+		dht.srClient, err = sr.NewSmartRecordClient(ctx, h, []sr.ClientOption{sr.ClientProtocolPrefix(cfg.ProtocolPrefix)}...)
+		if err != nil {
+			return nil, fmt.Errorf("couldn't start smart record client: %v", err)
+		}
 	}
 
 	if dht.mode == modeServer {
@@ -267,6 +285,10 @@ func makeDHT(ctx context.Context, h host.Host, cfg dhtcfg.Config) (*IpfsDHT, err
 	var protocols, serverProtocols []protocol.ID
 
 	v1proto := cfg.ProtocolPrefix + kad1
+	if cfg.SmartRecords {
+		// Use smart record protocols if enabled.
+		v1proto = cfg.ProtocolPrefix + srDhtId
+	}
 
 	if cfg.V1ProtocolOverride != "" {
 		v1proto = cfg.V1ProtocolOverride
